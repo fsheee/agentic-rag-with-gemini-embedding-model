@@ -34,7 +34,13 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=8.0",
 ]
+ingestion = [
+    "langchain-community>=0.4.2",
+    "pypdf>=6.15.0",
+]
 
+
+#"AWSTemplateFormatVersion": "2010-09-09"
 # torch (the CPU half of the embedding stack, pulled in by
 # sentence-transformers) is declared directly so the index below can be
 # applied to it — uv only honours [tool.uv.sources] for direct dependencies.
