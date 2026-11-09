@@ -1,3 +1,4 @@
+
 import re
 
 from app.guardrails import sanitize_context
@@ -19,28 +20,13 @@ def build_context(
     Shared by every consumer (CLI, API, LangGraph nodes) so retrieval exists
     in exactly one place. Retrieved chunks are untrusted content, so each
     block is sanitized before it is used in a prompt.
-
-    `access` is the set of document tiers the caller may read; see
-    app/access.py. Callers serving a request must pass one.
-
-    `history` is prior turns as [{"role", "content"}] dicts. When present
-    and `search_query` is not given, the question is first rewritten into a
-    standalone search query (see rewrite_query), because a follow-up such as
-    "what about the fees for that doctor?" retrieves poorly as written.
-
-    `search_query` is an already-resolved query to search with instead —
-    the agent rewrites once, before routing, so passing the result here
-    keeps that second condense call from happening. `question` still
-    reaches the answer prompt: retrieval and generation deliberately use
-    different strings.
-
-    Blocks are numbered so the LLM can cite the ones it actually used —
-    a retrieved-but-unused chunk (e.g. an HR handbook for a hospital
-    location question) must not appear as a source.
     """
     query = (
-        search_query if search_query is not None else rewrite_query(question, history)
+        search_query
+        if search_query is not None
+        else rewrite_query(question, history)
     )
+
     documents = retrieve_documents(query, access=access)
 
     return documents, format_blocks(documents)
@@ -48,13 +34,7 @@ def build_context(
 
 def format_blocks(documents: list) -> list[str]:
     """
-    Numbered context blocks for the prompt, and for any check that must
-    judge the answer against exactly what the model was shown.
-
-    Retrieved chunks are untrusted content, so each one is neutralised here
-    rather than at each call site. Blocks are numbered so the LLM can cite
-    the ones it actually used — a retrieved-but-unused chunk (e.g. an HR
-    handbook for a hospital location question) must not appear as a source.
+    Numbered context blocks for the prompt and grounding validation.
     """
     return [
         f"[{i}] {sanitize_context(document.page_content)}"
@@ -62,8 +42,7 @@ def format_blocks(documents: list) -> list[str]:
     ]
 
 
-# Cap on the rendered history block, independent of the per-message cap in
-# crud.MAX_MESSAGE_CHARS. Oldest turns are dropped once it is exceeded.
+# Cap on rendered conversation history.
 HISTORY_MAX_CHARS = 4000
 
 
@@ -71,18 +50,8 @@ def format_history(history: list[dict] | None) -> str:
     """
     Render past conversation turns for the prompt.
 
-    History is untrusted on replay: a stored turn can contain an injection
-    attempt that the guardrail blocked for the live turn, and assistant
-    turns embed retrieved-document text. Each message is therefore
-    neutralised with sanitize_context — the same treatment retrieved chunks
-    get in build_context.
-
-    Note this deliberately does NOT reuse check_user_input: that function's
-    job is to *reject* a turn, and rejecting here would abort every later
-    question in a conversation whose first turn once tripped a pattern.
-
-    When the rendered text exceeds HISTORY_MAX_CHARS the oldest turns are
-    dropped, so the most recent context always survives.
+    History is untrusted and is sanitized before being included.
+    Oldest turns are dropped when the character limit is exceeded.
     """
     if not history:
         return ""
@@ -104,26 +73,14 @@ def format_history(history: list[dict] | None) -> str:
     return "\n".join(reversed(lines))
 
 
-def rewrite_query(question: str, history: list[dict] | None) -> str:
+def rewrite_query(
+    question: str,
+    history: list[dict] | None,
+) -> str:
     """
     Turn a follow-up question into a standalone retrieval query.
 
-    History informs retrieval, not just the answer: without this, "and on
-    weekends?" is embedded verbatim and matches nothing.
-
-    One extra LLM call, and only when there is history to resolve against —
-    the CLI, the golden eval and a first turn all pass none and keep their
-    previous single-call behaviour.
-
-    Deliberately fails open: if the call raises or the model produces
-    nothing usable, the original question is used rather than aborting a
-    request that could otherwise have been answered.
-
-    History is untrusted on replay, so it is rendered through
-    format_history (which sanitizes it) and the model's output is
-    normalised by standalone_query. The rewritten query is used only to
-    search with; the answer prompt still receives the question as the user
-    actually asked it.
+    If rewriting fails, use the original question.
     """
     if not history:
         return question
@@ -135,9 +92,11 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
                 "question": question,
             }
         )
+
         response = get_llm().invoke(prompt)
 
         return standalone_query(_extract_text(response), question)
+
     except Exception as e:
         print(f"Query rewrite error: {e}")
         return question
@@ -145,14 +104,7 @@ def rewrite_query(question: str, history: list[dict] | None) -> str:
 
 def format_sources(documents: list) -> list[dict]:
     """
-    De-duplicated source citations: file + page, preserving order.
-
-    The citation is the bare filename, never the path it was loaded from.
-    `loader.py` stamps `str(file)`, so the same document appears as
-    `knowledge_base\\hospital_info.pdf` on Windows and
-    `knowledge_base/hospital_info.pdf` on Linux: leaking the host's path
-    layout and changing meaning between environments. Both separators are
-    handled so a collection ingested on one OS reads correctly on another.
+    Return deduplicated source citations: filename and page.
     """
     sources = []
     seen = set()
@@ -172,13 +124,19 @@ def format_sources(documents: list) -> list[dict]:
             continue
 
         seen.add(key)
-        sources.append({"source": source, "page": page + 1 if page is not None else None})
+
+        sources.append(
+            {
+                "source": source,
+                "page": page + 1 if page is not None else None,
+            }
+        )
 
     return sources
 
 
 def _extract_text(response) -> str:
-    """Gemini returns content as a list of parts; join the text."""
+    """Extract text from the LLM response."""
     content = response.content
 
     if isinstance(content, list):
@@ -193,28 +151,31 @@ def _extract_text(response) -> str:
 
 UNKNOWN_ANSWER = "I don't know based on the provided documents."
 
-# Trailing "Sources: 1, 2" line the prompt asks the LLM to emit. The model
-# also writes "Sources:" or "Sources: None" when it cites nothing; those must
-# strip too, otherwise the line stays inside the answer, the answer stops
-# matching UNKNOWN_ANSWER, and the fallback below cites every retrieved
-# document for an answer that cites none.
-SOURCES_LINE = re.compile(r"^sources?:\s*(?:none|[\d\s,]*)\s*$", re.IGNORECASE)
+
+# Recognize the final Sources line.
+SOURCES_LINE = re.compile(
+    r"^sources?:\s*(?:none|[\d\s,]*)\s*$",
+    re.IGNORECASE,
+)
 
 
-def _split_answer_and_sources(answer: str) -> tuple[str, list[int] | None]:
+def _split_answer_and_sources(
+    answer: str,
+) -> tuple[str, list[int] | None]:
     """
-    Split a trailing "Sources: <numbers>" line off the answer.
+    Split the final Sources line from the answer.
 
-    Returns (answer, cited block numbers):
-    - None  -> the model emitted no Sources line at all; the caller falls
-      back to citing every retrieved document.
-    - []    -> the model emitted "Sources:" / "Sources: None", i.e. it cited
-      nothing; the caller reports no sources.
+    None: no Sources line was provided.
+    []: Sources line was present but contained no citations.
     """
     lines = answer.strip().rsplit("\n", 1)
 
-    if len(lines) == 2 and SOURCES_LINE.fullmatch(lines[1].strip()):
+    if (
+        len(lines) == 2
+        and SOURCES_LINE.fullmatch(lines[1].strip())
+    ):
         numbers = re.findall(r"\d+", lines[1])
+
         return lines[0].strip(), [int(n) for n in numbers]
 
     return answer.strip(), None
@@ -230,25 +191,22 @@ def ask(
     The single reusable RAG entry point.
 
     question -> {answer, sources, documents}
-
-    `access` restricts retrieval to the given document tiers; see
-    app/access.py. Callers serving an authenticated or public request must
-    pass the tiers for that caller's role.
-
-    `history` is prior turns as [{"role", "content"}] dicts — plain data,
-    never ORM objects, so this module stays free of any database import.
-    It is optional: the CLI, the golden eval and rag_chain pass no history.
-
-    Retrieval embeds a standalone rewrite of `question` when history is
-    present (see rewrite_query), unless `search_query` already carries one
-    — the agent computes it once, before routing, and forwards it so the
-    rewrite is not paid for twice. The answer prompt still receives
-    `question` itself.
     """
     try:
         documents, blocks = build_context(
-            question, access=access, history=history, search_query=search_query
+            question,
+            access=access,
+            history=history,
+            search_query=search_query,
         )
+
+        # No retrieved documents: do not ask the LLM to guess.
+        if not documents:
+            return {
+                "answer": UNKNOWN_ANSWER,
+                "sources": [],
+                "documents": [],
+            }
 
         prompt = RAG_PROMPT.invoke(
             {
@@ -258,31 +216,38 @@ def ask(
             }
         )
 
+        # Generate the answer.
         response = get_llm().invoke(prompt)
 
-        answer, cited = _split_answer_and_sources(_extract_text(response))
+        answer, cited = _split_answer_and_sources(
+            _extract_text(response)
+        )
 
-        # No grounded answer -> no citations. Retrieving a document is not
-        # the same as it supporting an answer. The same holds when the model
-        # explicitly cites nothing ("Sources: None").
+        # Import locally to avoid a circular import:
+        # groundedness.py imports helper functions from core.py.
+        from .groundedness import is_grounded
+
+        # Reject answers that are not supported by retrieved documents.
+        if not is_grounded(answer, documents):
+            answer = UNKNOWN_ANSWER
+            cited = []
+
+        # No grounded answer or no citations means no sources.
         if answer == UNKNOWN_ANSWER or cited == []:
             sources = []
+
         elif cited is None:
-            # Model omitted the Sources line -> keep the previous behavior
-            # of citing every retrieved document. This is only safe because
-            # `documents` is already restricted to the caller's access tiers
-            # — anything that widens or re-merges this list (an unfiltered
-            # retry, a cache of another role's results) would turn this line
-            # into a leak.
+            # Preserve previous behavior when the Sources line is omitted.
             sources = format_sources(documents)
+
         else:
             supported = [
                 documents[number - 1]
                 for number in cited
                 if 1 <= number <= len(documents)
             ]
-            # Numbers matching no retrieved block are meaningless; fall back
-            # to the same access-restricted list as above.
+
+            # Ignore invalid citation numbers.
             sources = format_sources(supported or documents)
 
         return {
@@ -299,3 +264,308 @@ def ask(
             "sources": [],
             "documents": [],
         }
+
+
+
+
+# import re
+# from .groundedness import is_grounded
+# from app.guardrails import sanitize_context
+# from app.llm import get_llm
+# from app.prompt import RAG_PROMPT
+# from app.retriever import retrieve_documents
+# from app.rewriter import CONDENSE_PROMPT, standalone_query
+
+
+# def build_context(
+#     question: str,
+#     access: set[str] | None = None,
+#     history: list[dict] | None = None,
+#     search_query: str | None = None,
+# ) -> tuple[list, list[str]]:
+#     """
+#     Retrieve relevant documents and build numbered context blocks.
+
+#     Shared by every consumer (CLI, API, LangGraph nodes) so retrieval exists
+#     in exactly one place. Retrieved chunks are untrusted content, so each
+#     block is sanitized before it is used in a prompt.
+
+#     `access` is the set of document tiers the caller may read; see
+#     app/access.py. Callers serving a request must pass one.
+
+#     `history` is prior turns as [{"role", "content"}] dicts. When present
+#     and `search_query` is not given, the question is first rewritten into a
+#     standalone search query (see rewrite_query), because a follow-up such as
+#     "what about the fees for that doctor?" retrieves poorly as written.
+
+#     `search_query` is an already-resolved query to search with instead —
+#     the agent rewrites once, before routing, so passing the result here
+#     keeps that second condense call from happening. `question` still
+#     reaches the answer prompt: retrieval and generation deliberately use
+#     different strings.
+
+#     Blocks are numbered so the LLM can cite the ones it actually used —
+#     a retrieved-but-unused chunk (e.g. an HR handbook for a hospital
+#     location question) must not appear as a source.
+#     """
+#     query = (
+#         search_query if search_query is not None else rewrite_query(question, history)
+#     )
+#     documents = retrieve_documents(query, access=access)
+
+#     return documents, format_blocks(documents)
+
+
+# def format_blocks(documents: list) -> list[str]:
+#     """
+#     Numbered context blocks for the prompt, and for any check that must
+#     judge the answer against exactly what the model was shown.
+
+#     Retrieved chunks are untrusted content, so each one is neutralised here
+#     rather than at each call site. Blocks are numbered so the LLM can cite
+#     the ones it actually used — a retrieved-but-unused chunk (e.g. an HR
+#     handbook for a hospital location question) must not appear as a source.
+#     """
+#     return [
+#         f"[{i}] {sanitize_context(document.page_content)}"
+#         for i, document in enumerate(documents, 1)
+#     ]
+
+
+# # Cap on the rendered history block, independent of the per-message cap in
+# # crud.MAX_MESSAGE_CHARS. Oldest turns are dropped once it is exceeded.
+# HISTORY_MAX_CHARS = 4000
+
+
+# def format_history(history: list[dict] | None) -> str:
+#     """
+#     Render past conversation turns for the prompt.
+
+#     History is untrusted on replay: a stored turn can contain an injection
+#     attempt that the guardrail blocked for the live turn, and assistant
+#     turns embed retrieved-document text. Each message is therefore
+#     neutralised with sanitize_context — the same treatment retrieved chunks
+#     get in build_context.
+
+#     Note this deliberately does NOT reuse check_user_input: that function's
+#     job is to *reject* a turn, and rejecting here would abort every later
+#     question in a conversation whose first turn once tripped a pattern.
+
+#     When the rendered text exceeds HISTORY_MAX_CHARS the oldest turns are
+#     dropped, so the most recent context always survives.
+#     """
+#     if not history:
+#         return ""
+
+#     lines: list[str] = []
+#     total = 0
+
+#     for message in reversed(history):
+#         content = sanitize_context(str(message.get("content", "")))
+#         who = "User" if message.get("role") == "user" else "Assistant"
+#         line = f"{who}: {content}"
+
+#         if total + len(line) > HISTORY_MAX_CHARS:
+#             break
+
+#         lines.append(line)
+#         total += len(line)
+
+#     return "\n".join(reversed(lines))
+
+
+# def rewrite_query(question: str, history: list[dict] | None) -> str:
+#     """
+#     Turn a follow-up question into a standalone retrieval query.
+
+#     History informs retrieval, not just the answer: without this, "and on
+#     weekends?" is embedded verbatim and matches nothing.
+
+#     One extra LLM call, and only when there is history to resolve against —
+#     the CLI, the golden eval and a first turn all pass none and keep their
+#     previous single-call behaviour.
+
+#     Deliberately fails open: if the call raises or the model produces
+#     nothing usable, the original question is used rather than aborting a
+#     request that could otherwise have been answered.
+
+#     History is untrusted on replay, so it is rendered through
+#     format_history (which sanitizes it) and the model's output is
+#     normalised by standalone_query. The rewritten query is used only to
+#     search with; the answer prompt still receives the question as the user
+#     actually asked it.
+#     """
+#     if not history:
+#         return question
+
+#     try:
+#         prompt = CONDENSE_PROMPT.invoke(
+#             {
+#                 "history": format_history(history),
+#                 "question": question,
+#             }
+#         )
+#         response = get_llm().invoke(prompt)
+
+#         return standalone_query(_extract_text(response), question)
+#     except Exception as e:
+#         print(f"Query rewrite error: {e}")
+#         return question
+
+
+# def format_sources(documents: list) -> list[dict]:
+#     """
+#     De-duplicated source citations: file + page, preserving order.
+
+#     The citation is the bare filename, never the path it was loaded from.
+#     `loader.py` stamps `str(file)`, so the same document appears as
+#     `knowledge_base\\hospital_info.pdf` on Windows and
+#     `knowledge_base/hospital_info.pdf` on Linux: leaking the host's path
+#     layout and changing meaning between environments. Both separators are
+#     handled so a collection ingested on one OS reads correctly on another.
+#     """
+#     sources = []
+#     seen = set()
+
+#     for document in documents:
+#         raw = document.metadata.get("source")
+#         page = document.metadata.get("page")
+
+#         if not raw:
+#             continue
+
+#         source = str(raw).replace("\\", "/").rsplit("/", 1)[-1]
+
+#         key = (source, page)
+
+#         if key in seen:
+#             continue
+
+#         seen.add(key)
+#         sources.append({"source": source, "page": page + 1 if page is not None else None})
+
+#     return sources
+
+
+# def _extract_text(response) -> str:
+#     """Gemini returns content as a list of parts; join the text."""
+#     content = response.content
+
+#     if isinstance(content, list):
+#         return "".join(
+#             part.get("text", "")
+#             for part in content
+#             if isinstance(part, dict)
+#         ).strip()
+
+#     return content
+
+
+# UNKNOWN_ANSWER = "I don't know based on the provided documents."
+
+# # Trailing "Sources: 1, 2" line the prompt asks the LLM to emit. The model
+# # also writes "Sources:" or "Sources: None" when it cites nothing; those must
+# # strip too, otherwise the line stays inside the answer, the answer stops
+# # matching UNKNOWN_ANSWER, and the fallback below cites every retrieved
+# # document for an answer that cites none.
+# SOURCES_LINE = re.compile(r"^sources?:\s*(?:none|[\d\s,]*)\s*$", re.IGNORECASE)
+
+
+# def _split_answer_and_sources(answer: str) -> tuple[str, list[int] | None]:
+#     """
+#     Split a trailing "Sources: <numbers>" line off the answer.
+
+#     Returns (answer, cited block numbers):
+#     - None  -> the model emitted no Sources line at all; the caller falls
+#       back to citing every retrieved document.
+#     - []    -> the model emitted "Sources:" / "Sources: None", i.e. it cited
+#       nothing; the caller reports no sources.
+#     """
+#     lines = answer.strip().rsplit("\n", 1)
+
+#     if len(lines) == 2 and SOURCES_LINE.fullmatch(lines[1].strip()):
+#         numbers = re.findall(r"\d+", lines[1])
+#         return lines[0].strip(), [int(n) for n in numbers]
+
+#     return answer.strip(), None
+
+
+# def ask(
+#     question: str,
+#     access: set[str] | None = None,
+#     history: list[dict] | None = None,
+#     search_query: str | None = None,
+# ) -> dict:
+#     """
+#     The single reusable RAG entry point.
+
+#     question -> {answer, sources, documents}
+
+#     `access` restricts retrieval to the given document tiers; see
+#     app/access.py. Callers serving an authenticated or public request must
+#     pass the tiers for that caller's role.
+
+#     `history` is prior turns as [{"role", "content"}] dicts — plain data,
+#     never ORM objects, so this module stays free of any database import.
+#     It is optional: the CLI, the golden eval and rag_chain pass no history.
+
+#     Retrieval embeds a standalone rewrite of `question` when history is
+#     present (see rewrite_query), unless `search_query` already carries one
+#     — the agent computes it once, before routing, and forwards it so the
+#     rewrite is not paid for twice. The answer prompt still receives
+#     `question` itself.
+#     """
+#     try:
+#         documents, blocks = build_context(
+#             question, access=access, history=history, search_query=search_query
+#         )
+
+#         prompt = RAG_PROMPT.invoke(
+#             {
+#                 "history": format_history(history),
+#                 "context": "\n\n".join(blocks),
+#                 "input": question,
+#             }
+#         )
+
+#         response = get_llm().invoke(prompt)
+
+#         answer, cited = _split_answer_and_sources(_extract_text(response))
+
+#         # No grounded answer -> no citations. Retrieving a document is not
+#         # the same as it supporting an answer. The same holds when the model
+#         # explicitly cites nothing ("Sources: None").
+#         if answer == UNKNOWN_ANSWER or cited == []:
+#             sources = []
+#         elif cited is None:
+#             # Model omitted the Sources line -> keep the previous behavior
+#             # of citing every retrieved document. This is only safe because
+#             # `documents` is already restricted to the caller's access tiers
+#             # — anything that widens or re-merges this list (an unfiltered
+#             # retry, a cache of another role's results) would turn this line
+#             # into a leak.
+#             sources = format_sources(documents)
+#         else:
+#             supported = [
+#                 documents[number - 1]
+#                 for number in cited
+#                 if 1 <= number <= len(documents)
+#             ]
+#             # Numbers matching no retrieved block are meaningless; fall back
+#             # to the same access-restricted list as above.
+#             sources = format_sources(supported or documents)
+
+#         return {
+#             "answer": answer,
+#             "sources": sources,
+#             "documents": documents,
+#         }
+
+#     except Exception as e:
+#         print(f"RAG error: {e}")
+
+#         return {
+#             "answer": "Sorry, I couldn't generate an answer right now.",
+#             "sources": [],
+#             "documents": [],
+#         }

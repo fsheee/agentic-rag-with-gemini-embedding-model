@@ -1,19 +1,25 @@
-from langchain_huggingface import HuggingFaceEmbeddings
-from app.config import EMBEDDING_MODEL
+
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+from app.config import GOOGLE_API_KEY, EMBEDDING_MODEL
 
 
-def get_embeddings():
+def get_embeddings() -> GoogleGenerativeAIEmbeddings:
     """
-    Create the embedding model.
+    Initialize and return the Gemini embedding model.
     """
+
+    if not GOOGLE_API_KEY:
+        raise ValueError(
+            "GOOGLE_API_KEY is not set. Add it to your .env file."
+        )
 
     if not EMBEDDING_MODEL:
         raise ValueError(
             "EMBEDDING_MODEL is not set. Add it to your .env file."
         )
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL
+    return GoogleGenerativeAIEmbeddings(
+        model=EMBEDDING_MODEL,
+        google_api_key=GOOGLE_API_KEY,
     )
-
-    return embeddings

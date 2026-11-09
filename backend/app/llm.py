@@ -1,3 +1,4 @@
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 
@@ -12,25 +13,36 @@ from .config import (
 
 
 def get_llm():
-    """Return the chat model with a bounded call budget.
+    """Initialize the configured chat model."""
 
-    Without a timeout a stalled provider call pins a worker thread until the
-    client gives up; without retries a single dropped packet turns into a
-    failed request. Both limits are enforced by the provider SDK.
-    """
     if GOOGLE_API_KEY:
+        if not GEMINI_MODEL:
+            raise ValueError(
+                "GEMINI_MODEL is not set in your .env file."
+            )
+
         return ChatGoogleGenerativeAI(
             model=GEMINI_MODEL,
-            api_key=GOOGLE_API_KEY,
+            google_api_key=GOOGLE_API_KEY,
             temperature=0,
             timeout=LLM_TIMEOUT_SECONDS,
             max_retries=LLM_MAX_RETRIES,
         )
 
-    return ChatGroq(
-        model=MODEL_NAME,
-        api_key=GROQ_API_KEY,
-        temperature=0,
-        request_timeout=LLM_TIMEOUT_SECONDS,
-        max_retries=LLM_MAX_RETRIES,
+    if GROQ_API_KEY:
+        if not MODEL_NAME:
+            raise ValueError(
+                "MODEL_NAME is not set in your .env file."
+            )
+
+        return ChatGroq(
+            model=MODEL_NAME,
+            api_key=GROQ_API_KEY,
+            temperature=0,
+            timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=LLM_MAX_RETRIES,
+        )
+
+    raise ValueError(
+        "No LLM API key configured. Set GOOGLE_API_KEY or GROQ_API_KEY."
     )
