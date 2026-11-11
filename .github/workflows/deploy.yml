@@ -46,7 +46,7 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           version: latest
-          python-version: "3.12"
+          python-version: "3.12.4"
           enable-cache: true
 
       - name: Install dependencies
@@ -116,3 +116,5 @@ jobs:
           url=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "Deployed to $url" >> "$GITHUB_STEP_SUMMARY"
+
+          
