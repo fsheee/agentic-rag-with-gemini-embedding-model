@@ -15,7 +15,7 @@ concurrency:
 jobs:
   test:
     name: Test suite
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       JWT_SECRET: ci-only-not-a-real-secret-do-not-use-in-production
