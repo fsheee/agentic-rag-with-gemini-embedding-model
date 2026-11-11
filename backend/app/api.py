@@ -1,10 +1,12 @@
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.gzip import GZipMiddleware
@@ -13,6 +15,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, func, select
 from starlette.requests import Request
+
+# Make `from app...` imports work even when PYTHONPATH is not set in the
+# deployment environment (e.g. Vercel).
+_BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
 
 from app.agent import run_agent
 from app.appointment_routes import router as appointment_router
