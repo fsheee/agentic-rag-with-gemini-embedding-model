@@ -1,6 +1,16 @@
+import pytest
 from langchain_core.documents import Document
 
-from app import core
+from app import core, groundedness
+
+
+@pytest.fixture(autouse=True)
+def _bypass_grounding_judge(monkeypatch):
+    monkeypatch.setattr(
+        groundedness,
+        "is_grounded",
+        lambda answer, documents: True,
+    )
 
 
 class FakeResponse:

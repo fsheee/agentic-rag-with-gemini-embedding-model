@@ -44,6 +44,7 @@ def test_get_llm_passes_timeout_and_retries_to_gemini(monkeypatch):
 
     monkeypatch.setattr(llm, "ChatGoogleGenerativeAI", FakeGemini)
     monkeypatch.setattr(llm, "GOOGLE_API_KEY", "key")
+    monkeypatch.setattr(llm, "GEMINI_MODEL", "test-gemini-model")
 
     llm.get_llm()
 
@@ -60,10 +61,12 @@ def test_get_llm_passes_timeout_and_retries_to_groq(monkeypatch):
 
     monkeypatch.setattr(llm, "ChatGroq", FakeGroq)
     monkeypatch.setattr(llm, "GOOGLE_API_KEY", None)
+    monkeypatch.setattr(llm, "GROQ_API_KEY", "groq-key")
+    monkeypatch.setattr(llm, "MODEL_NAME", "test-groq-model")
 
     llm.get_llm()
 
-    assert captured["request_timeout"] == llm.LLM_TIMEOUT_SECONDS
+    assert captured["timeout"] == llm.LLM_TIMEOUT_SECONDS
     assert captured["max_retries"] == llm.LLM_MAX_RETRIES
 
 
