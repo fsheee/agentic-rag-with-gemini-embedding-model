@@ -71,9 +71,22 @@ jobs:
       VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
       VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
       PYTHONPATH: backend
+      # vercel build must resolve the exact interpreter .python-version pins.
+      # Without this it warns "3.12 not installed", builds the venv with
+      # 3.14, and the cp314 extension modules (pydantic_core, pydantic_core,
+      # etc.) fail to import on the 3.12 runtime: FUNCTION_INVOCATION_FAILED.
+      UV_PYTHON: "3.12"
 
     steps:
       - uses: actions/checkout@v4
+
+      # Put a real 3.12 on PATH: Vercel's Python builder looks for an
+      # installed interpreter matching .python-version and otherwise falls
+      # back to 3.14, producing wheels with a mismatched ABI tag.
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -81,7 +94,7 @@ jobs:
          version: latest
          python-version: "3.12"
          enable-cache: true
-      
+
       - name: Verify uv
         run: |
           uv --version
