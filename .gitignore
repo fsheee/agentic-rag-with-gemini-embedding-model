@@ -9,6 +9,7 @@ wheels/
 
 # Virtual environments
 .venv
+.venv-old
 .env
 
 # Vercel CLI link/build output (written by `vercel pull` / `vercel build`)
