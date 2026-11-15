@@ -52,7 +52,7 @@ Role and identity always come from the signed JWT and are enforced in Python
 knowledge_base/ (PDF/TXT)
   ↓  loader.py     load + attach access tier to metadata
   ↓  splitter.py   chunk 500 / overlap 100
-  ↓  embedding.py  all-MiniLM-L6-v2
+  ↓  embedding.py  Gemini embeddings (gemini-embedding-001)
   ↓  ingest.py     deterministic IDs → idempotent upsert + stale pruning
 Qdrant
   ↓  retriever.py  top-k + access filter + relevance thresholds
@@ -89,12 +89,13 @@ agent-rag/
 │   ├── auth.py              bcrypt hashing + JWT helpers
 │   ├── auth_routes.py       /auth/* endpoints + role dependencies
 │   ├── appointment_routes.py REST CRUD for doctors & appointments
+│   ├── conversation_routes.py GET /conversations/* — restore chat history
 │   ├── access.py            knowledge-base access tiers (public/staff)
 │   ├── config.py            env-driven settings (thresholds, offline mode)
 │   ├── core.py              single RAG entry point (ask/build_context)
 │   ├── crud.py              parameterized DB access
 │   ├── db.py                SQLModel engine + session dependency
-│   ├── embedding.py         HuggingFace embeddings
+│   ├── embedding.py         Gemini embeddings (Google API)
 │   ├── guardrails.py        injection screening + context sanitization
 │   ├── ingest.py            idempotent Qdrant ingestion
 │   ├── llm.py               Groq / Gemini client (temperature 0)
@@ -125,11 +126,11 @@ agent-rag/
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.12 (pinned by `.python-version`)
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - A PostgreSQL database (a managed Neon instance works out of the box)
 - A Qdrant instance — local mode (default, `qdrant_data/`) or a managed **Qdrant Cloud** cluster
-- An LLM API key (Groq or Google Gemini)
+- A Google Gemini API key — used for both the LLM and the embeddings (Groq remains supported for the LLM only)
 
 ### Qdrant: local vs. cloud
 
@@ -180,7 +181,7 @@ cp .env.example .env
 | `MODEL_NAME` | Groq model | `openai/gpt-oss-120b` |
 | `GOOGLE_API_KEY` | Gemini key — when set, the LLM switches to Gemini | — |
 | `GEMINI_MODEL` | Gemini model | `gemini-3.1-flash-lite` |
-| `EMBEDDING_MODEL` | HuggingFace embedding model | `sentence-transformers/all-MiniLM-L6-v2` |
+| `EMBEDDING_MODEL` | Gemini embedding model (requires `GOOGLE_API_KEY`) | `models/gemini-embedding-001` |
 | `DATABASE_URL` | PostgreSQL connection string | — |
 | `POOL_RECYCLE_SECONDS` / `POOL_SIZE` / `POOL_MAX_OVERFLOW` / `POOL_TIMEOUT_SECONDS` | Connection-pool tuning (`pool_pre_ping` is always on) | `1800` / `5` / `10` / `30` |
 | `JWT_SECRET` | HMAC secret for signing tokens | — |
@@ -198,11 +199,12 @@ cp .env.example .env
 | `LOG_LEVEL` | App log level | `INFO` |
 | `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` / `LANGSMITH_PROJECT` | LangSmith tracing (optional) | — |
 
-`JWT_SECRET` is required to serve the API, and an embedding model is required
-for retrieval. `DATABASE_URL` is required too, but it is checked lazily — at
-the first database call, not at startup — so a missing value surfaces as a
-runtime error rather than an import failure. `GOOGLE_API_KEY` takes precedence
-over Groq when both are set.
+`JWT_SECRET` is required to serve the API. Embeddings always run through the
+Gemini API (`EMBEDDING_MODEL`, default `models/gemini-embedding-001`) and need
+`GOOGLE_API_KEY`; there is no local embedding model. `DATABASE_URL` is required
+too, but it is checked lazily — at the first database call, not at startup —
+so a missing value surfaces as a runtime error rather than an import failure.
+`GOOGLE_API_KEY` takes precedence over Groq for the LLM when both are set.
 
 ### 3. Ingest the knowledge base
 
@@ -287,6 +289,31 @@ Role assignment is never client-controlled: `/auth/register` always creates a
 patient, and `/auth/users` enforces `CREATION_RULES` — admins create
 employee/doctor/hr, HR creates employees. Admins are created only by the seed
 script, never through the API.
+
+### Conversations — `/conversations`
+
+| Method | Path | Auth | Description |
+| --- | --- | --- | --- |
+| `GET` | `/conversations` | token | The caller's chats, most recently active first (title + timestamps, no messages). |
+| `GET` | `/conversations/{id}` | token | One conversation with its **full** transcript, oldest message first — everything, not the 10-message window the prompt sees. |
+
+Both are ownership-scoped the same way as `conversation_id` on `/ask`: the id
+is filtered on id **and** owner together, so another user's conversation
+resolves to `404` (never `403`, which would confirm the row exists). These are
+the restore-history endpoints a client calls on reload to redraw past chats.
+
+```json
+{
+  "id": 7,
+  "title": "What are the hospital visiting hours?",
+  "created_at": "2026-11-15T10:00:00",
+  "updated_at": "2026-11-15T10:02:00",
+  "messages": [
+    { "role": "user", "content": "What are the hospital visiting hours?", "created_at": "..." },
+    { "role": "assistant", "content": "Visiting hours are 10 AM to 8 PM daily.", "created_at": "..." }
+  ]
+}
+```
 
 ### Doctors
 
@@ -401,7 +428,8 @@ patients (their own) and admins; anonymous callers are denied outright.
 ## Testing
 
 Tests live in `tests/` and exercise each module in isolation (Qdrant, the
-database, and LLMs are mocked). 314 tests, verified with `--collect-only`.
+database, and LLMs are mocked). 329 tests collected — 316 run by default, 13
+marked `integration`.
 
 ```bash
 uv run pytest -q
@@ -430,29 +458,55 @@ uv run pytest -q -m "not integration"
 
 ## Deployment notes
 
-This repository is not containerized yet — there is no `Dockerfile` or
-`docker-compose.yml` at the root. To run it as a service you need:
+### Vercel (current)
 
-- Python 3.11+ with `uv` (or an equivalent image) and `app.*` importable
-  (set `PYTHONPATH=backend`)
-- A reachable PostgreSQL instance via `DATABASE_URL`
-- A reachable Qdrant — **recommended: Qdrant Cloud via `QDRANT_URL` (+ `QDRANT_API_KEY`)**; local mode needs a persistent mounted `qdrant_data/` volume and loses vectors otherwise
+`.github/workflows/deploy.yml` runs the test suite on every PR and push, then
+deploys to Vercel **only from `main` after tests pass**: `vercel build --prod`
+followed by `vercel deploy --prebuilt`, using `VERCEL_TOKEN` / `VERCEL_ORG_ID` /
+`VERCEL_PROJECT_ID` repository secrets.
 
-Start command:
+Runtime values live in the Vercel dashboard (Production environment), not in
+the workflow: `PYTHONPATH=backend` (required — the app imports `app.*`),
+`DATABASE_URL`, `JWT_SECRET`, `GOOGLE_API_KEY`, `EMBEDDING_MODEL`, `QDRANT_URL`,
+`QDRANT_API_KEY`, `ALLOWED_ORIGINS`.
+
+Two gotchas recorded in `ISSUE.MD` §8:
+
+- **Deployment Protection.** Per-deployment URLs
+  (`…-<hash>.vercel.app`) serve Vercel's "Login" interstitial for every path
+  — with HTTP 200 — to signed-out visitors. Always share and health-check the
+  production alias (`agentic-rag-with-gemini-embedding-m.vercel.app`).
+- **`GET /favicon.ico` 404s** on each page view (no icon route yet).
+
+Two more carried in the workflow itself:
+
+- **Python ABI pin.** Vercel's builder needs a real 3.12 on PATH (the job
+  installs `setup-python` 3.12 and `UV_PYTHON=3.12`); otherwise it builds the
+  venv with 3.14 against `.python-version`, the `cp314` wheels
+  (`pydantic_core`, …) fail to import on the 3.12 runtime, and every request
+  dies with `FUNCTION_INVOCATION_FAILED`.
+- **Schema and vectors are not created by the workflow.** Run once against
+  production (and re-run `ingest` after any access-tier change):
+
+  ```bash
+  python -m app.seed     # tables + sample data
+  python -m app.ingest   # knowledge base → Qdrant (QDRANT_URL must point at the cloud cluster)
+  ```
+
+### Elsewhere
+
+There is still no `Dockerfile` or `docker-compose.yml`; to run as a plain
+service you need Python 3.12 with `app.*` importable (`PYTHONPATH=backend`),
+`DATABASE_URL`, and a reachable Qdrant — **recommended: Qdrant Cloud via
+`QDRANT_URL` (+ `QDRANT_API_KEY`)**; local mode needs a persistent mounted
+`qdrant_data/` volume and loses vectors otherwise.
 
 ```bash
 uvicorn app.api:app --host 0.0.0.0 --port 8000
 ```
 
-Create the schema and seed data before the first request:
-
-```bash
-python -m app.seed     # tables + sample data
-python -m app.ingest   # knowledge base → Qdrant
-```
-
 Health checks should target `/health` (returns `503` when the database is
-unreachable) rather than `/`, which has no route.
+unreachable) rather than `/`, which serves only a small JSON info block.
 
 ---
 
@@ -464,7 +518,7 @@ unreachable) rather than `/`, which has no route.
 - **PostgreSQL** (Neon) — relational data, auth, conversations, pending bookings
 - **SQLModel** — schema + ORM
 - **Groq / Google Gemini** — LLM inference
-- **HuggingFace sentence-transformers** — embeddings
+- **Google Gemini embeddings** — embedding inference (no local model weight: `sentence-transformers` was dropped for its dependency size and memory, not for any Vercel limit — see `ISSUE.MD` §7)
 - **PyJWT + bcrypt** — auth
 - **uv** — dependency management
 
@@ -476,7 +530,7 @@ The design notes live alongside the code as separate documents:
 
 | Document | What it covers |
 | --- | --- |
-| [`plan.md`](plan.md) | The full status of the build — what exists per phase, the required setup steps, what is left (Docker, CI/CD, deployment), and every known rough edge. The authoritative source of truth for where the project stands. |
+| [`plan.md`](plan.md) | The full status of the build — what exists per phase, the required setup steps, the shipped CI/CD and Vercel deployment, what is left (Docker), and every known rough edge. The authoritative source of truth for where the project stands. |
 | [`ISSUE.MD`](ISSUE.MD) | Institutional memory: the problems hit while building this (duplicate chunks, hallucinated answers, prompt injection, anonymous-access escalation, cross-user leaks, in-process booking state, date-parsing failures, config timing, routing) and how each was fixed. |
 | [`PRODUCTION-HARDENING.MD`](PRODUCTION-HARDENING.MD) | Reliability, observability and basic security: logging, `GET /health`, rate limiting, global exception handling, database connection resilience, LLM timeout/retry, and request-size protection. |
 | [`RAG-EVALUATION.MD`](RAG-EVALUATION.MD) | The quality dimensions used to evaluate retrieval and generation: correctness, faithfulness (groundedness), context relevance, answer relevance, and no-answer behaviour. |

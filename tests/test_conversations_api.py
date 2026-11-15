@@ -9,6 +9,8 @@ user, anonymous callers get no memory at all, and history replayed into
 the prompt is treated as untrusted data.
 """
 
+from datetime import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
@@ -397,3 +399,102 @@ def test_conversation_lookup_filters_by_owner(ctx):
         assert (
             get_conversation_for_user(session, conversation.id, users["bob"].id) is None
         )
+
+
+# --------------------------------------------------------------------------
+# Restoring history (GET /conversations)
+# --------------------------------------------------------------------------
+
+
+def test_conversations_list_requires_auth(ctx):
+    http, _users, _engine = ctx
+
+    response = http.get("/conversations")
+
+    assert response.status_code == 401
+
+
+def test_conversations_list_returns_only_the_callers_chats(ctx):
+    http, users, engine = ctx
+
+    with Session(engine) as session:
+        alice_first = create_conversation(session, users["alice"].id, "alice first")
+        alice_first_id = alice_first.id
+        alice_second = create_conversation(session, users["alice"].id, "alice second")
+        alice_second_id = alice_second.id
+        create_conversation(session, users["bob"].id, "bob private")
+
+        # Don't race the clock here: on Windows two datetime.now() calls
+        # microseconds apart can land on the same ~15ms tick, giving both
+        # conversations an identical updated_at. Pin it so this test checks
+        # ordering, not clock granularity.
+        alice_first.updated_at = datetime(2026, 1, 2, 12, 0, 0)
+        alice_second.updated_at = datetime(2026, 1, 1, 12, 0, 0)
+        session.add(alice_first)
+        session.add(alice_second)
+        session.commit()
+
+    response = http.get("/conversations", headers=_auth(users["alice"]))
+
+    assert response.status_code == 200
+    chats = response.json()
+    assert [c["title"] for c in chats] == ["alice first", "alice second"]
+    # Most recently active first: the pinned updated_at, not creation order.
+    assert chats[0]["id"] == alice_first_id
+    assert chats[1]["id"] == alice_second_id
+    # Bob's chat is never visible to Alice.
+    assert "bob private" not in [c["title"] for c in chats]
+
+
+def test_conversation_messages_return_the_full_transcript(ctx):
+    """Restore serves everything, not the 10-message prompt window."""
+    http, users, engine = ctx
+
+    with Session(engine) as session:
+        conversation = create_conversation(session, users["alice"].id, "long chat")
+        conversation_id = conversation.id
+        for index in range(15):
+            append_message(session, conversation_id, "user", f"message {index}")
+
+    response = http.get(
+        f"/conversations/{conversation_id}", headers=_auth(users["alice"])
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["title"] == "long chat"
+    assert len(body["messages"]) == 15  # get_recent_messages would return 10
+    assert [m["content"] for m in body["messages"]] == [
+        f"message {index}" for index in range(15)
+    ]
+    assert set(body["messages"][0]) == {"role", "content", "created_at"}
+
+
+def test_other_users_conversation_is_404_on_restore(ctx):
+    """Same rule as /ask: 404, not 403, so existence is never revealed."""
+    http, users, engine = ctx
+
+    with Session(engine) as session:
+        conversation = create_conversation(session, users["alice"].id, "secret")
+        conversation_id = conversation.id
+
+    assert (
+        http.get(f"/conversations/{conversation_id}", headers=_auth(users["bob"])).status_code
+        == 404
+    )
+    assert http.get("/conversations/9999", headers=_auth(users["alice"])).status_code == 404
+    assert http.get(f"/conversations/{conversation_id}").status_code == 401
+
+    # Alice still reads her own.
+    assert (
+        http.get(f"/conversations/{conversation_id}", headers=_auth(users["alice"])).status_code
+        == 200
+    )
+
+
+def test_conversation_id_must_be_an_integer_on_restore(ctx):
+    http, users, _engine = ctx
+
+    response = http.get("/conversations/abc", headers=_auth(users["alice"]))
+
+    assert response.status_code == 422

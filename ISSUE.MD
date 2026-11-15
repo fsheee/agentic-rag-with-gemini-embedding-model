@@ -175,6 +175,19 @@ lessons, not hypotheticals.
 
 ## 7. SDK / dependency issues
 
+- **HuggingFace embeddings dropped for weight — not for a Vercel limit.**
+  `sentence-transformers/all-MiniLM-L6-v2` ran through `HuggingFaceEmbeddings`
+  and pulled torch + sentence-transformers into the dependency tree: hundreds
+  of MB of wheels, a model download on cold start, and resident memory that
+  sits badly in a serverless instance (the Vercel function was already
+  reporting ~317 MB on a single request). Replaced with
+  `GoogleGenerativeAIEmbeddings` (`EMBEDDING_MODEL=models/gemini-embedding-001`,
+  `GOOGLE_API_KEY`) in `backend/app/embedding.py` (`2dca966`), so embedding
+  is an API call and no model weight ships or loads at runtime. Recorded
+  explicitly because the cause is easy to misread: **the Vercel execution /
+  function-limit errors were not the reason** — the switch was about
+  dependency size and memory. (README.md previously still said
+  "HuggingFace embeddings"; it now matches `embedding.py`.)
 - **google-genai AFC warning — known, not silenced here.** google-genai 2.x
   enables automatic function calling inside `Models.generate_content` and
   logs a warning recommending `Chat.send_message`, even when no callable
@@ -186,6 +199,36 @@ lessons, not hypotheticals.
   {"disable": True})` on the Gemini model in `backend/app/llm.py`; that
   file currently sets only timeout and retries, so the warning still
   appears.
+
+---
+
+## 8. Vercel deployment issues
+
+- **Deployment-specific URLs sit behind Vercel Deployment Protection.** A
+  per-deployment URL (`…-<dpl-hash>.vercel.app`) serves Vercel's
+  "Login – Vercel" SSO interstitial for *every* path — `/`, `/docs`,
+  `/openapi.json` — while still returning **HTTP 200**, so it looks like a
+  healthy page that just renders wrong. The production alias
+  (`agentic-rag-with-gemini-embedding-m.vercel.app`) is unaffected and
+  serves the real app. Diagnosis trap: an unauthenticated client sees
+  status 200 with a 337 KB HTML body, not a JSON error, so a naive health
+  check or `fetch()` cannot tell "working" from "walled off". Fix if
+  public preview links are wanted: Project → Settings → Deployment
+  Protection → disable Vercel Authentication (keeping it for preview
+  deployments only is the usual compromise).
+- **`GET /favicon.ico` returns 404 on every visit.** Browsers request it
+  automatically whenever a page is opened; the API serves JSON at `/` with
+  no `<link rel="icon">` declared, so the request falls through to the
+  FastAPI function and logs a 404 each time. Harmless to correctness but
+  it costs one function invocation per page view and clutters request
+  logs. **Not fixed yet** — the plan is a `/favicon.ico` route in
+  `api.py` (or a `<link rel="icon">` on any future HTML root) shipped
+  through the existing `deploy.yml` workflow.
+- **Swagger UI needs `/openapi.json` reachable on the same origin.** On a
+  protected deployment URL the docs page loads but stays blank because
+  the OpenAPI fetch is intercepted by the login page above; on the public
+  alias it loads with all 14 routes. Any "docs are broken" report should
+  be checked against the alias first.
 
 ---
 
@@ -213,6 +256,9 @@ Known and deliberately deferred — see `plan.md` for the full discussion:
 
 - Past dates are bookable (`check_slot()` has no calendar check; the
   `MONDAY = 2026-09-28` test fixture is now in the past).
+- `GET /favicon.ico` 404s per page view (section 8); deployment-specific
+  URLs are walled behind Vercel Deployment Protection while the
+  production alias stays public.
 - The google-genai AFC warning is not silenced in this tree.
 - Up to three LLM calls per turn with history (condense + answer +
   groundedness judge), uncached.

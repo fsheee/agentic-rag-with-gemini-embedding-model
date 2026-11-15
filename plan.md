@@ -374,22 +374,37 @@ longer decides which store you get.
 
 Ordered by dependency; each step should land and be tested before the next.
 
-### 1. Docker
+### 1. CI/CD — shipped
+
+Two workflows in `.github/workflows/`:
+
+- **`ci.yml`** — on every push and PR: `uv sync --frozen` →
+  `pytest -q -m "not integration"` on Python 3.12 (from `.python-version`),
+  uv-cached, with a CI-only `JWT_SECRET` so auth imports work. No lint step:
+  there is still **no linter configured** in `pyproject.toml`.
+- **`deploy.yml`** — runs the same suite, then deploys to Vercel **only from
+  `main` after tests pass** (`vercel build --prod` → `vercel deploy
+  --prebuilt`). Runtime env vars live in the Vercel dashboard
+  (`PYTHONPATH=backend`, `DATABASE_URL`, `JWT_SECRET`, `GOOGLE_API_KEY`,
+  `EMBEDDING_MODEL`, `QDRANT_URL`, `QDRANT_API_KEY`, `ALLOWED_ORIGINS`), never
+  committed. Gotchas recorded in the workflow and `ISSUE.MD` §8: the Python
+  ABI pin (`UV_PYTHON=3.12`, else `cp314` wheels fail with
+  `FUNCTION_INVOCATION_FAILED`), schema/vectors are *not* created by the
+  workflow (`app.seed` / `app.ingest` run once against production), and
+  per-deployment URLs sit behind Vercel Deployment Protection.
+
+### 2. Deployment — shipped (Vercel)
+
+The production alias (`agentic-rag-with-gemini-embedding-m.vercel.app`) serves
+the API publicly; `/health` is the real probe (`503` when the database is
+unreachable). Neon connection string, JWT secret and keys are injected as
+environment variables — never committed.
+
+### 3. Docker — still open
 
 `Dockerfile` for FastAPI, `docker-compose.yml` for FastAPI + Qdrant. Neon
 stays managed cloud — no local Postgres container. The `PYTHONPATH=backend`
 requirement from the setup step has to be encoded in the image.
-
-### 2. CI/CD
-
-GitHub Actions: lint → tests → Docker build. Must run the `app.seed`
-migration against a test database. Note there is currently **no linter
-configured** in `pyproject.toml`.
-
-### 3. Deployment
-
-FastAPI + Qdrant hosted; Neon connection string and JWT secret injected as
-environment variables — never committed.
 
 ---
 

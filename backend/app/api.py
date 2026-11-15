@@ -25,6 +25,7 @@ if _BACKEND_DIR not in sys.path:
 from app.agent import run_agent
 from app.appointment_routes import router as appointment_router
 from app.auth_routes import get_optional_user, router as auth_router
+from app.conversation_routes import router as conversation_router
 from app.crud import (
     append_message,
     create_conversation,
@@ -261,6 +262,7 @@ async def request_body_too_large_handler(
 
 app.include_router(auth_router)
 app.include_router(appointment_router)
+app.include_router(conversation_router)
 
 
 @app.get("/")

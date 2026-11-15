@@ -265,6 +265,37 @@ def get_conversation_for_user(
     ).first()
 
 
+def list_conversations(session: Session, user_id: int) -> list[Conversation]:
+    """The user's conversations, most recently active first.
+
+    updated_at is what "recent chats" means: append_message bumps it on
+    every turn, so the ordering reflects the last activity, not creation.
+    """
+    return list(
+        session.exec(
+            select(Conversation)
+            .where(Conversation.user_id == user_id)
+            .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+        ).all()
+    )
+
+
+def get_messages(session: Session, conversation_id: int) -> list[Message]:
+    """The full transcript, oldest first.
+
+    Unlike get_recent_messages there is no window: this serves the
+    restore-history endpoint, where the client wants everything that was
+    said, not just the turns the prompt will see.
+    """
+    return list(
+        session.exec(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.id)
+        ).all()
+    )
+
+
 def append_message(
     session: Session, conversation_id: int, role: str, content: str
 ) -> Message:
