@@ -16,6 +16,22 @@ memory, and plain REST CRUD for doctors and appointments.
 > This document covers the **backend only**. There is no frontend in scope
 > here; the API is a plain HTTP service consumed by any client.
 
+### Live backend (deployed on Vercel)
+
+| | |
+| --- | --- |
+| **Base URL** | <https://agentic-rag-with-gemini-embedding-m.vercel.app> |
+| **Interactive docs** | <https://agentic-rag-with-gemini-embedding-m.vercel.app/docs> |
+| **Health probe** | <https://agentic-rag-with-gemini-embedding-m.vercel.app/health> |
+| **OpenAPI spec** | <https://agentic-rag-with-gemini-embedding-m.vercel.app/openapi.json> |
+
+Anonymous calls work out of the box (`POST /ask`); register via
+`/auth/register` for conversation memory and booking. Per-deployment URLs
+(`…-<hash>.vercel.app`, e.g.
+`agentic-rag-with-gemini-embedding-model-jqa23dzhi.vercel.app`) sit behind
+**Vercel Deployment Protection** and show a Vercel login page to signed-out
+visitors — always use the alias above (see `ISSUE.MD` §8).
+
 ---
 
 ## Architecture
