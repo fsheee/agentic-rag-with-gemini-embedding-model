@@ -263,6 +263,20 @@ app.include_router(auth_router)
 app.include_router(appointment_router)
 
 
+@app.get("/")
+def root() -> JSONResponse:
+    """Landing point so opening the deployment URL in a browser shows a
+    usable page instead of a bare 404 (or Vercel's error page)."""
+    return JSONResponse(
+        {
+            "name": "Agentic RAG API",
+            "status": "running",
+            "docs": "/docs",
+            "health": "/health",
+        }
+    )
+
+
 @app.get("/health")
 def health(session: Session = Depends(get_session)) -> JSONResponse:
     """Liveness probe: the database must answer a trivial query.
